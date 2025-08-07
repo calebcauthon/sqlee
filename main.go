@@ -14,6 +14,7 @@ import (
 
 type model struct {
     db              *sql.DB
+    allTables       []string
     tables          []string
     cursor          int
     preview         [][]string
@@ -21,6 +22,8 @@ type model struct {
     status          string
     width           int
     height          int
+    searchActive    bool
+    searchQuery     string
 }
 
 func openDB() (*sql.DB, error) {
@@ -68,10 +71,8 @@ func initialModel() model {
         m.status = fmt.Sprintf("list tables error: %v", err)
     }
     sort.Strings(tables)
-    m.tables = tables
-    if len(m.tables) > 0 {
-        m.refreshPreview()
-    }
+    m.allTables = tables
+    m.applyFilter()
     return m
 }
 
@@ -149,6 +150,29 @@ func (m *model) refreshPreview() {
     }
 }
 
+func (m *model) applyFilter() {
+    if m.searchQuery == "" {
+        // show all
+        m.tables = append([]string(nil), m.allTables...)
+    } else {
+        q := strings.ToLower(m.searchQuery)
+        filtered := make([]string, 0, len(m.allTables))
+        for _, t := range m.allTables {
+            if strings.Contains(strings.ToLower(t), q) {
+                filtered = append(filtered, t)
+            }
+        }
+        m.tables = filtered
+    }
+    if m.cursor >= len(m.tables) {
+        m.cursor = max(0, len(m.tables)-1)
+    }
+    if m.cursor < 0 {
+        m.cursor = 0
+    }
+    m.refreshPreview()
+}
+
 func quoteIdent(id string) string {
     // Basic quoting for identifiers; double any embedded quotes.
     return "\"" + strings.ReplaceAll(id, "\"", "\"\"") + "\""
@@ -186,12 +210,64 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
+        // If currently searching, handle input editing first
+        if m.searchActive {
+            switch msg.Type {
+            case tea.KeyRunes:
+                if len(msg.Runes) > 0 {
+                    m.searchQuery += string(msg.Runes)
+                    m.applyFilter()
+                }
+                return m, nil
+            case tea.KeyBackspace:
+                r := []rune(m.searchQuery)
+                if len(r) > 0 {
+                    m.searchQuery = string(r[:len(r)-1])
+                    m.applyFilter()
+                }
+                return m, nil
+            case tea.KeyEnter:
+                m.searchActive = false
+                return m, nil
+            case tea.KeyEsc:
+                m.searchActive = false
+                if m.searchQuery != "" {
+                    m.searchQuery = ""
+                    m.applyFilter()
+                }
+                return m, nil
+            }
+            // allow navigation and quitting while in search
+            switch msg.String() {
+            case "ctrl+c", "q":
+                if m.db != nil {
+                    _ = m.db.Close()
+                }
+                return m, tea.Quit
+            case "up", "k":
+                if m.cursor > 0 {
+                    m.cursor--
+                    m.refreshPreview()
+                }
+                return m, nil
+            case "down", "j":
+                if m.cursor < len(m.tables)-1 {
+                    m.cursor++
+                    m.refreshPreview()
+                }
+                return m, nil
+            }
+            return m, nil
+        }
         switch msg.String() {
         case "ctrl+c", "q":
             if m.db != nil {
                 _ = m.db.Close()
             }
             return m, tea.Quit
+        case "/":
+            m.searchActive = true
+            return m, nil
         case "up", "k":
             if m.cursor > 0 {
                 m.cursor--
@@ -210,11 +286,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                     m.status = fmt.Sprintf("reload error: %v", err)
                 } else {
                     sort.Strings(t)
-                    m.tables = t
-                    if m.cursor >= len(m.tables) {
-                        m.cursor = max(0, len(m.tables)-1)
-                    }
-                    m.refreshPreview()
+                    m.allTables = t
+                    m.applyFilter()
                 }
             }
         }
@@ -247,7 +320,10 @@ func (m model) View() string {
 
     // Render tables list
     var left strings.Builder
-    left.WriteString("Tables (j/k or ↓/↑ to move, r to reload, q to quit)\n")
+    left.WriteString("Tables (j/k or ↓/↑ to move, / search, r reload, q quit)\n")
+    if m.searchActive || m.searchQuery != "" {
+        left.WriteString("/" + m.searchQuery + "\n")
+    }
     for i, t := range m.tables {
         cursor := "  "
         if i == m.cursor {
