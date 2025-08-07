@@ -5,8 +5,10 @@ import (
     "fmt"
     "os"
     "path/filepath"
+    "runtime"
     "sort"
     "strings"
+    "os/exec"
 
     tea "github.com/charmbracelet/bubbletea"
     _ "modernc.org/sqlite"
@@ -24,6 +26,9 @@ type model struct {
     height          int
     searchActive    bool
     searchQuery     string
+    focusPreview    bool
+    selRow          int
+    selCol          int
 }
 
 func openDB() (*sql.DB, error) {
@@ -148,6 +153,13 @@ func (m *model) refreshPreview() {
     if err := rows.Err(); err != nil {
         m.status = fmt.Sprintf("rows error: %v", err)
     }
+    // Clamp selection indexes
+    if m.selRow >= len(m.preview) {
+        m.selRow = max(0, len(m.preview)-1)
+    }
+    if m.selCol >= len(m.previewColumns) {
+        m.selCol = max(0, len(m.previewColumns)-1)
+    }
 }
 
 func (m *model) applyFilter() {
@@ -214,12 +226,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         if m.searchActive {
             switch msg.Type {
             case tea.KeyRunes:
+                if m.focusPreview {
+                    return m, nil
+                }
                 if len(msg.Runes) > 0 {
                     m.searchQuery += string(msg.Runes)
                     m.applyFilter()
                 }
                 return m, nil
             case tea.KeyBackspace:
+                if m.focusPreview {
+                    return m, nil
+                }
                 r := []rune(m.searchQuery)
                 if len(r) > 0 {
                     m.searchQuery = string(r[:len(r)-1])
@@ -245,15 +263,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 }
                 return m, tea.Quit
             case "up", "k":
-                if m.cursor > 0 {
-                    m.cursor--
-                    m.refreshPreview()
+                if !m.focusPreview {
+                    if m.cursor > 0 { m.cursor--; m.refreshPreview() }
+                } else {
+                    if m.selRow > 0 { m.selRow-- }
                 }
                 return m, nil
             case "down", "j":
-                if m.cursor < len(m.tables)-1 {
-                    m.cursor++
-                    m.refreshPreview()
+                if !m.focusPreview {
+                    if m.cursor < len(m.tables)-1 { m.cursor++; m.refreshPreview() }
+                } else {
+                    if m.selRow+1 < len(m.preview) { m.selRow++ }
+                }
+                return m, nil
+            case "left":
+                if m.focusPreview {
+                    if m.selCol > 0 { m.selCol-- } else { m.focusPreview = false }
+                }
+                return m, nil
+            case "right":
+                if !m.focusPreview {
+                    m.focusPreview = true
+                    m.searchActive = false
+                    if m.selRow >= len(m.preview) { m.selRow = 0 }
+                    if m.selCol >= len(m.previewColumns) { m.selCol = 0 }
+                } else if m.selCol+1 < len(m.previewColumns) {
+                    m.selCol++
                 }
                 return m, nil
             }
@@ -265,18 +300,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 _ = m.db.Close()
             }
             return m, tea.Quit
+        case "left", "h":
+            if m.focusPreview {
+                if msg.String() == "h" {
+                    // treat like left as well
+                }
+                if m.selCol > 0 {
+                    m.selCol--
+                } else {
+                    m.focusPreview = false
+                }
+            }
+        case "right", "l":
+            if !m.focusPreview {
+                m.focusPreview = true
+                if m.selRow >= len(m.preview) { m.selRow = 0 }
+                if m.selCol >= len(m.previewColumns) { m.selCol = 0 }
+            } else if m.selCol+1 < len(m.previewColumns) {
+                m.selCol++
+            }
         case "/":
-            m.searchActive = true
+            if !m.focusPreview {
+                m.searchActive = true
+            }
             return m, nil
         case "up", "k":
-            if m.cursor > 0 {
-                m.cursor--
-                m.refreshPreview()
+            if !m.focusPreview {
+                if m.cursor > 0 { m.cursor--; m.refreshPreview() }
+            } else {
+                if m.selRow > 0 { m.selRow-- }
             }
         case "down", "j":
-            if m.cursor < len(m.tables)-1 {
-                m.cursor++
-                m.refreshPreview()
+            if !m.focusPreview {
+                if m.cursor < len(m.tables)-1 { m.cursor++; m.refreshPreview() }
+            } else {
+                if m.selRow+1 < len(m.preview) { m.selRow++ }
+            }
+        case "y":
+            if m.focusPreview && m.selRow >= 0 && m.selRow < len(m.preview) && m.selCol >= 0 && m.selCol < len(m.previewColumns) {
+                val := ""
+                if len(m.preview) > 0 {
+                    row := m.preview[m.selRow]
+                    if m.selCol < len(row) {
+                        val = row[m.selCol]
+                    }
+                }
+                if err := copyToClipboard(val); err != nil {
+                    m.status = fmt.Sprintf("copy error: %v", err)
+                } else {
+                    m.status = "copied"
+                }
             }
         case "r":
             // reload tables
@@ -320,13 +393,13 @@ func (m model) View() string {
 
     // Render tables list
     var left strings.Builder
-    left.WriteString("Tables (j/k or ↓/↑ to move, / search, r reload, q quit)\n")
+    left.WriteString("Tables (j/k or ↓/↑, → to preview, / search, r reload, q quit)\n")
     if m.searchActive || m.searchQuery != "" {
         left.WriteString("/" + m.searchQuery + "\n")
     }
     for i, t := range m.tables {
         cursor := "  "
-        if i == m.cursor {
+        if i == m.cursor && !m.focusPreview {
             cursor = "> "
         }
         // truncate table name to leftWidth-2
@@ -339,13 +412,19 @@ func (m model) View() string {
     if len(m.tables) == 0 {
         right.WriteString("No tables found.\n")
     } else {
-        right.WriteString(fmt.Sprintf("Preview: %s (up to 10 rows)\n", m.tables[m.cursor]))
+        title := fmt.Sprintf("Preview: %s (up to 10 rows)", m.tables[m.cursor])
+        if m.focusPreview { title += " [FOCUS]" }
+        right.WriteString(title + "\n")
         if len(m.previewColumns) > 0 {
             // compute column widths based on available rightWidth
             colWidths := computeColumnWidths(m.previewColumns, m.preview, rightWidth)
             // header
             for i, c := range m.previewColumns {
-                cell := padRight(truncateCell(c, colWidths[i]), colWidths[i])
+                header := c
+                if m.focusPreview && i == m.selCol {
+                    header = "*" + header
+                }
+                cell := padRight(truncateCell(header, colWidths[i]), colWidths[i])
                 right.WriteString(cell)
                 if i < len(m.previewColumns)-1 {
                     right.WriteString(" ")
@@ -361,7 +440,13 @@ func (m model) View() string {
             }
             right.WriteString("\n")
             // rows
-            for _, row := range m.preview {
+            for ri, row := range m.preview {
+                // row cursor in preview focus
+                if m.focusPreview && ri == m.selRow {
+                    right.WriteString("> ")
+                } else {
+                    right.WriteString("  ")
+                }
                 for i, cell := range row {
                     cell = truncateCell(cell, colWidths[i])
                     right.WriteString(padRight(cell, colWidths[i]))
@@ -487,4 +572,38 @@ func main() {
     }
 }
 
+
+// copyToClipboard copies given text to the system clipboard across platforms.
+func copyToClipboard(text string) error {
+    switch runtime.GOOS {
+    case "darwin":
+        cmd := exec.Command("pbcopy")
+        cmd.Stdin = strings.NewReader(text)
+        return cmd.Run()
+    case "windows":
+        // Use clip.exe
+        cmd := exec.Command("cmd", "/c", "clip")
+        cmd.Stdin = strings.NewReader(text)
+        return cmd.Run()
+    default:
+        // Linux and others: try wl-copy, then xclip
+        if _, err := exec.LookPath("wl-copy"); err == nil {
+            cmd := exec.Command("wl-copy")
+            cmd.Stdin = strings.NewReader(text)
+            return cmd.Run()
+        }
+        if _, err := exec.LookPath("xclip"); err == nil {
+            cmd := exec.Command("xclip", "-selection", "clipboard")
+            cmd.Stdin = strings.NewReader(text)
+            return cmd.Run()
+        }
+        // Last resort: xsel
+        if _, err := exec.LookPath("xsel"); err == nil {
+            cmd := exec.Command("xsel", "--clipboard", "--input")
+            cmd.Stdin = strings.NewReader(text)
+            return cmd.Run()
+        }
+        return fmt.Errorf("no clipboard utility found (install wl-copy, xclip, or xsel)")
+    }
+}
 
