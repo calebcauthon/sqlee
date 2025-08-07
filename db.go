@@ -77,7 +77,7 @@ func getTableInfo(db *sql.DB, table string) ([]colInfo, error) {
         if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
             return nil, err
         }
-        out = append(out, colInfo{Name: name, Type: ctype, PKOrder: pk})
+        out = append(out, colInfo{Name: name, Type: ctype, PKOrder: pk, NotNull: notnull == 1, Default: dflt})
     }
     return out, rows.Err()
 }

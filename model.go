@@ -37,6 +37,8 @@ type colInfo struct {
     Name    string
     Type    string
     PKOrder int // 0 means not PK; 1..N for composite order
+    NotNull bool
+    Default sql.NullString
 }
 
 type uniqueIndex struct {

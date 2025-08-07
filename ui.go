@@ -239,11 +239,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             }
         case "i":
             if m.focusPreview {
-                if err := m.duplicateCurrentRow(); err != nil {
-                    m.status = fmt.Sprintf("insert error: %v", err)
+                if len(m.preview) == 0 {
+                    if err := m.insertEmptyRow(); err != nil {
+                        m.status = fmt.Sprintf("insert error: %v", err)
+                    } else {
+                        m.status = "inserted new row"
+                        m.refreshPreview()
+                    }
                 } else {
-                    m.status = "inserted duplicate row"
-                    m.refreshPreview()
+                    if err := m.duplicateCurrentRow(); err != nil {
+                        m.status = fmt.Sprintf("insert error: %v", err)
+                    } else {
+                        m.status = "inserted duplicate row"
+                        m.refreshPreview()
+                    }
                 }
             }
         case "r":

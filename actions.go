@@ -121,6 +121,62 @@ func (m *model) duplicateCurrentRow() error {
     return err
 }
 
+// insertEmptyRow creates a new row using DEFAULT VALUES for the current table.
+// This works when the table has defaults or nullable columns. If NOT NULL
+// constraints without defaults exist, SQLite will return an error which we
+// surface to the user.
+func (m *model) insertEmptyRow() error {
+    if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
+        return fmt.Errorf("no table selected")
+    }
+    table := m.tables[m.cursor]
+    // Prefer DEFAULT VALUES when possible; but if table has NOT NULL columns without defaults,
+    // fallback to constructing an explicit INSERT with minimal placeholder values.
+    // First, try DEFAULT VALUES quickly.
+    if _, err := m.db.Exec(fmt.Sprintf("INSERT INTO %s DEFAULT VALUES", quoteIdent(table))); err == nil {
+        return nil
+    }
+    // Build column/value lists honoring NOT NULL and defaults
+    insertCols := make([]string, 0, len(m.tableCols))
+    params := make([]any, 0, len(m.tableCols))
+    values := make([]string, 0, len(m.tableCols))
+    for _, c := range m.tableCols {
+        // Skip INTEGER PRIMARY KEY so SQLite can auto-assign rowid
+        if c.PKOrder > 0 && strings.EqualFold(strings.TrimSpace(c.Type), "INTEGER") {
+            continue
+        }
+        // If column has non-NULL default, omit and let default apply
+        if c.Default.Valid {
+            // Omitting the column lets DEFAULT be used
+            continue
+        }
+        // If NOT NULL with no default, supply a minimal value by type
+        if c.NotNull {
+            insertCols = append(insertCols, c.Name)
+            tUpper := strings.ToUpper(strings.TrimSpace(c.Type))
+            if isTextType(tUpper) {
+                params = append(params, "")
+            } else if isNumericType(tUpper) {
+                params = append(params, 0)
+            } else {
+                // Blob/unknown -> empty blob as text fallback
+                params = append(params, "")
+            }
+            values = append(values, "?")
+            continue
+        }
+        // Nullable with no default: omit to get NULL
+    }
+    if len(insertCols) == 0 {
+        // Nothing to set explicitly, last resort retry DEFAULT VALUES to surface the original error
+        _, err := m.db.Exec(fmt.Sprintf("INSERT INTO %s DEFAULT VALUES", quoteIdent(table)))
+        return err
+    }
+    q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(table), quoteIdentList(insertCols), strings.Join(values, ", "))
+    _, err := m.db.Exec(q, params...)
+    return err
+}
+
 func (m *model) deleteCurrentRow() error {
     if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
         return fmt.Errorf("no table selected")
