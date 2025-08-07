@@ -13,6 +13,40 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
+        // If currently editing a cell, handle input differently
+        if m.editingActive {
+            switch msg.Type {
+            case tea.KeyRunes:
+                if len(msg.Runes) > 0 {
+                    m.editBuffer += string(msg.Runes)
+                }
+                return m, nil
+            case tea.KeyBackspace:
+                r := []rune(m.editBuffer)
+                if len(r) > 0 {
+                    m.editBuffer = string(r[:len(r)-1])
+                }
+                return m, nil
+            case tea.KeyEnter:
+                // commit edit
+                if err := m.commitCellEdit(); err != nil {
+                    m.status = fmt.Sprintf("update error: %v", err)
+                } else {
+                    m.status = "updated"
+                }
+                m.editingActive = false
+                m.editBuffer = ""
+                m.refreshPreview()
+                return m, nil
+            case tea.KeyEsc:
+                m.editingActive = false
+                m.editBuffer = ""
+                m.status = "cancelled edit"
+                return m, nil
+            default:
+                return m, nil
+            }
+        }
         // Confirmation modal for table/view deletion
         if m.confirmDeleteActive {
             switch msg.String() {
@@ -121,6 +155,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 _ = m.db.Close()
             }
             return m, tea.Quit
+        case "c":
+            // begin editing the current cell when focus is on preview
+            if m.focusPreview && m.selRow >= 0 && m.selRow < len(m.preview) && m.selCol >= 0 && m.selCol < len(m.previewColumns) {
+                m.editingActive = true
+                // seed buffer with current cell text
+                cur := m.preview[m.selRow]
+                if m.selCol < len(cur) { m.editBuffer = cur[m.selCol] } else { m.editBuffer = "" }
+                m.status = fmt.Sprintf("editing %s", m.previewColumns[m.selCol])
+            }
         case "left", "h":
             if m.focusPreview {
                 if msg.String() == "h" {
@@ -264,6 +307,7 @@ func (m model) View() string {
     } else {
         title := fmt.Sprintf("Preview: %s (up to 10 rows)", m.tables[m.cursor])
         if m.focusPreview { title += " " + styleFocusTag.Render("FOCUS") }
+        if m.editingActive { title += " " + stylePrompt.Render("EDITING") }
         right.WriteString(styleHeader.Render(title) + "\n")
         if len(m.previewColumns) > 0 {
             // compute column widths based on available rightWidth minus the 2-char row gutter
@@ -304,6 +348,10 @@ func (m model) View() string {
                 // row cursor in preview focus
                 if m.focusPreview && ri == m.selRow { right.WriteString(styleCursor.Render("> ")) } else { right.WriteString("  ") }
                 for i, cell := range row {
+                    // If editing this cell, render buffer
+                    if m.editingActive && m.focusPreview && ri == m.selRow && i == m.selCol {
+                        cell = m.editBuffer
+                    }
                     cell = truncateCell(cell, colWidths[i])
                     right.WriteString(padRightANSI(cell, colWidths[i]))
                     if i < len(row)-1 {

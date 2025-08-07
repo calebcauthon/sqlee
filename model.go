@@ -24,6 +24,9 @@ type model struct {
     focusPreview    bool
     selRow          int
     selCol          int
+    // inline cell edit state
+    editingActive   bool
+    editBuffer      string
     // table deletion confirm state
     confirmDeleteActive bool
     confirmDeleteTarget string

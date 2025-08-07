@@ -162,6 +162,60 @@ func (m *model) deleteCurrentRow() error {
     return err
 }
 
+// commitCellEdit updates the database with the current editBuffer for the selected cell.
+func (m *model) commitCellEdit() error {
+    if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
+        return fmt.Errorf("no table selected")
+    }
+    if m.selRow < 0 || m.selRow >= len(m.preview) {
+        return fmt.Errorf("no row selected")
+    }
+    if m.selCol < 0 || m.selCol >= len(m.previewColumns) {
+        return fmt.Errorf("no column selected")
+    }
+    table := m.tables[m.cursor]
+    colName := m.previewColumns[m.selCol]
+    // Interpret literal NULL (case-insensitive) as SQL NULL
+    var newVal any = m.editBuffer
+    if strings.EqualFold(strings.TrimSpace(m.editBuffer), "NULL") {
+        newVal = nil
+    }
+    // Prefer explicit PKs for WHERE condition; support composite PK
+    var pkCols []colInfo
+    for _, c := range m.tableCols {
+        if c.PKOrder > 0 { pkCols = append(pkCols, c) }
+    }
+    if len(pkCols) > 0 {
+        // Build UPDATE ... WHERE pk1=? AND pk2=? ...
+        setExpr := fmt.Sprintf("%s = ?", quoteIdent(colName))
+        whereParts := make([]string, 0, len(pkCols))
+        params := make([]any, 0, len(pkCols)+1)
+        params = append(params, newVal)
+        for _, pk := range pkCols {
+            whereParts = append(whereParts, fmt.Sprintf("%s = ?", quoteIdent(pk.Name)))
+            // pull value from current preview row
+            idx := findColIndex(m.previewColumns, pk.Name)
+            if idx >= 0 && idx < len(m.preview[m.selRow]) {
+                params = append(params, m.preview[m.selRow][idx])
+            } else {
+                params = append(params, nil)
+            }
+        }
+        q := fmt.Sprintf("UPDATE %s SET %s WHERE %s", quoteIdent(table), setExpr, strings.Join(whereParts, " AND "))
+        _, err := m.db.Exec(q, params...)
+        return err
+    }
+    // Fallback to rowid
+    if m.previewRowIDs == nil || m.selRow >= len(m.previewRowIDs) {
+        return fmt.Errorf("cannot resolve row identifier (no pk/rowid)")
+    }
+    rowid := m.previewRowIDs[m.selRow]
+    setExpr := fmt.Sprintf("%s = ?", quoteIdent(colName))
+    q := fmt.Sprintf("UPDATE %s SET %s WHERE rowid = ?", quoteIdent(table), setExpr)
+    _, err := m.db.Exec(q, newVal, rowid)
+    return err
+}
+
 func (m *model) computeUniqueOverrides(table string, insertCols []string, colType map[string]string, uidx []uniqueIndex, changed map[string]struct{}, overrides map[string]any) error {
     // Build quick set for present columns
     present := make(map[string]struct{}, len(insertCols))
