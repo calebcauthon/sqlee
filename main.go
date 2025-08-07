@@ -10,8 +10,11 @@ import (
     "sort"
     "strings"
     "os/exec"
+    "regexp"
+    "unicode/utf8"
 
     tea "github.com/charmbracelet/bubbletea"
+    "github.com/charmbracelet/lipgloss"
     "github.com/google/uuid"
     _ "modernc.org/sqlite"
 )
@@ -33,6 +36,10 @@ type model struct {
     focusPreview    bool
     selRow          int
     selCol          int
+    // table deletion confirm state
+    confirmDeleteActive bool
+    confirmDeleteTarget string
+    confirmDeleteType   string // "table" or "view"
 }
 
 type colInfo struct {
@@ -44,6 +51,95 @@ type colInfo struct {
 type uniqueIndex struct {
     Name    string
     Columns []string
+}
+
+var (
+    styleHeader    = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
+    stylePrompt    = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+    styleSearch    = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+    styleCursor    = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+    styleFocusTag  = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(true)
+    styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+    styleInfo      = lipgloss.NewStyle().Foreground(lipgloss.Color("178"))
+    styleColSelect = lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Bold(true)
+)
+
+// ansiRegexp matches ANSI SGR escape sequences for styling (e.g., "\x1b[31m").
+var ansiRegexp = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// visibleWidth returns the printable width of s excluding ANSI escape sequences.
+func visibleWidth(s string) int {
+    if s == "" { return 0 }
+    // Strip ANSI, then count runes
+    plain := ansiRegexp.ReplaceAllString(s, "")
+    return len([]rune(plain))
+}
+
+// truncateANSI truncates s to max printable columns, preserving ANSI sequences.
+func truncateANSI(s string, max int) string {
+    if max <= 0 || s == "" { return "" }
+    // Fast path: no ANSI sequences
+    if !strings.Contains(s, "\x1b[") {
+        // Truncate by runes to avoid breaking multibyte chars
+        r := []rune(s)
+        if len(r) <= max { return s }
+        return string(r[:max])
+    }
+    // Walk bytes, preserve ANSI codes, count printable runes
+    var out []byte
+    count := 0
+    i := 0
+    b := []byte(s)
+    for i < len(b) && count < max {
+        if b[i] == 0x1b && i+1 < len(b) && b[i+1] == '[' { // ESC[
+            // copy until 'm' inclusive (best-effort for SGR)
+            j := i + 2
+            for j < len(b) {
+                if (b[j] >= 'A' && b[j] <= 'Z') || (b[j] >= 'a' && b[j] <= 'z') { // final byte
+                    j++
+                    break
+                }
+                j++
+            }
+            out = append(out, b[i:j]...)
+            i = j
+            continue
+        }
+        // decode next rune
+        r, size := utf8.DecodeRune(b[i:])
+        if r == utf8.RuneError && size == 1 {
+            // invalid byte; treat as single-width
+            out = append(out, b[i])
+            i++
+            count++
+            continue
+        }
+        if count+1 > max { break }
+        out = append(out, b[i:i+size]...)
+        i += size
+        count++
+    }
+    return string(out)
+}
+
+// padRightANSI pads s with spaces to reach width printable columns, or truncates if longer.
+func padRightANSI(s string, width int) string {
+    if width <= 0 { return "" }
+    vw := visibleWidth(s)
+    if vw >= width {
+        return truncateANSI(s, width)
+    }
+    return s + strings.Repeat(" ", width-vw)
+}
+
+// stripANSI removes ANSI escape sequences from a string.
+func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
+
+// hasRightPaneGutter reports whether s starts (visibly) with the two-char right pane gutter
+// such as "> " (styled) or "  ".
+func hasRightPaneGutter(s string) bool {
+    plain := stripANSI(s)
+    return strings.HasPrefix(plain, "> ") || strings.HasPrefix(plain, "  ")
 }
 
 func openDB() (*sql.DB, error) {
@@ -284,6 +380,36 @@ func (m model) Init() tea.Cmd { return nil }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
+        // Confirmation modal for table/view deletion
+        if m.confirmDeleteActive {
+            switch msg.String() {
+            case "y", "Y":
+                if err := m.deleteCurrentTable(); err != nil {
+                    m.status = fmt.Sprintf("drop %s error: %v", m.confirmDeleteType, err)
+                } else {
+                    m.status = fmt.Sprintf("dropped %s %s", m.confirmDeleteType, m.confirmDeleteTarget)
+                    // reload tables
+                    if m.db != nil {
+                        if t, err := listTables(m.db); err == nil {
+                            sort.Strings(t)
+                            m.allTables = t
+                            // keep filter
+                            m.applyFilter()
+                        }
+                    }
+                }
+                m.confirmDeleteActive = false
+                m.confirmDeleteTarget = ""
+                return m, nil
+            case "n", "N", "esc":
+                m.confirmDeleteActive = false
+                m.confirmDeleteTarget = ""
+                m.status = "cancelled"
+                return m, nil
+            default:
+                return m, nil
+            }
+        }
         // If currently searching, handle input editing first
         if m.searchActive {
             switch msg.Type {
@@ -386,6 +512,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 m.searchActive = true
             }
             return m, nil
+        case "x":
+            if m.focusPreview {
+                prev := m.selRow
+                if err := m.deleteCurrentRow(); err != nil {
+                    m.status = fmt.Sprintf("delete error: %v", err)
+                } else {
+                    m.status = "deleted row"
+                    if prev > 0 && prev == len(m.preview)-1 { m.selRow = prev - 1 }
+                    m.refreshPreview()
+                }
+            } else if m.cursor >= 0 && m.cursor < len(m.tables) {
+                // from the left pane: request confirmation to drop table or view
+                name := m.tables[m.cursor]
+                // determine if table or view
+                t, err := getObjectType(m.db, name)
+                if err != nil { m.status = fmt.Sprintf("lookup type error: %v", err); return m, nil }
+                m.confirmDeleteActive = true
+                m.confirmDeleteTarget = name
+                m.confirmDeleteType = t
+                m.status = fmt.Sprintf("drop %s %s? (y/n)", t, name)
+            }
+            return m, nil
         case "up", "k":
             if !m.focusPreview {
                 if m.cursor > 0 { m.cursor--; m.refreshPreview() }
@@ -464,14 +612,14 @@ func (m model) View() string {
 
     // Render tables list
     var left strings.Builder
-    left.WriteString("Tables (j/k or ↓/↑, → to preview, / search, r reload, q quit)\n")
+    left.WriteString(styleHeader.Render("Tables (j/k or ↓/↑, → to preview, / search, r reload, q quit)") + "\n")
     if m.searchActive || m.searchQuery != "" {
-        left.WriteString("/" + m.searchQuery + "\n")
+        left.WriteString(styleSearch.Render("/" + m.searchQuery) + "\n")
     }
     for i, t := range m.tables {
         cursor := "  "
         if i == m.cursor && !m.focusPreview {
-            cursor = "> "
+            cursor = styleCursor.Render("> ")
         }
         // truncate table name to leftWidth-2
         name := truncateCell(t, max(1, leftWidth-2))
@@ -484,25 +632,35 @@ func (m model) View() string {
         right.WriteString("No tables found.\n")
     } else {
         title := fmt.Sprintf("Preview: %s (up to 10 rows)", m.tables[m.cursor])
-        if m.focusPreview { title += " [FOCUS]" }
-        right.WriteString(title + "\n")
+        if m.focusPreview { title += " " + styleFocusTag.Render("FOCUS") }
+        right.WriteString(styleHeader.Render(title) + "\n")
         if len(m.previewColumns) > 0 {
-            // compute column widths based on available rightWidth
-            colWidths := computeColumnWidths(m.previewColumns, m.preview, rightWidth)
-            // header
+            // compute column widths based on available rightWidth minus the 2-char row gutter
+            cwAvail := rightWidth - 2
+            if cwAvail < 1 { cwAvail = 1 }
+            colWidths := computeColumnWidths(m.previewColumns, m.preview, cwAvail)
+            // header (align with row gutter)
+            right.WriteString("  ")
             for i, c := range m.previewColumns {
-                header := c
-                if m.focusPreview && i == m.selCol {
-                    header = "*" + header
+                headerText := c
+                // add selection marker before truncation
+                isSelectedHeader := m.focusPreview && i == m.selCol
+                if isSelectedHeader {
+                    headerText = "*" + headerText
                 }
-                cell := padRight(truncateCell(header, colWidths[i]), colWidths[i])
+                headerText = truncateCell(headerText, colWidths[i])
+                if isSelectedHeader {
+                    headerText = styleColSelect.Render(headerText)
+                }
+                cell := padRightANSI(headerText, colWidths[i])
                 right.WriteString(cell)
                 if i < len(m.previewColumns)-1 {
                     right.WriteString(" ")
                 }
             }
             right.WriteString("\n")
-            // separator
+            // separator (align with row gutter)
+            right.WriteString("  ")
             for i := range m.previewColumns {
                 right.WriteString(strings.Repeat("-", colWidths[i]))
                 if i < len(m.previewColumns)-1 {
@@ -513,14 +671,10 @@ func (m model) View() string {
             // rows
             for ri, row := range m.preview {
                 // row cursor in preview focus
-                if m.focusPreview && ri == m.selRow {
-                    right.WriteString("> ")
-                } else {
-                    right.WriteString("  ")
-                }
+                if m.focusPreview && ri == m.selRow { right.WriteString(styleCursor.Render("> ")) } else { right.WriteString("  ") }
                 for i, cell := range row {
                     cell = truncateCell(cell, colWidths[i])
-                    right.WriteString(padRight(cell, colWidths[i]))
+                    right.WriteString(padRightANSI(cell, colWidths[i]))
                     if i < len(row)-1 {
                         right.WriteString(" ")
                     }
@@ -543,12 +697,16 @@ func (m model) View() string {
     for i := 0; i < maxLines; i++ {
         var l, r string
         if i < len(leftLines) {
-            l = padRight(truncateCell(leftLines[i], leftWidth), leftWidth)
+            l = padRightANSI(truncateANSI(leftLines[i], leftWidth), leftWidth)
         } else {
             l = strings.Repeat(" ", leftWidth)
         }
         if i < len(rightLines) {
             r = rightLines[i]
+            // Ensure a consistent two-char gutter on the right pane for all lines
+            if !hasRightPaneGutter(r) {
+                r = "  " + r
+            }
         } else {
             r = ""
         }
@@ -558,7 +716,17 @@ func (m model) View() string {
         out.WriteString("\n")
     }
     if m.status != "" {
-        out.WriteString("\n" + m.status + "\n")
+        // Highlight confirmation prompts vs info/errors
+        rendered := m.status
+        ls := strings.ToLower(m.status)
+        if strings.HasPrefix(ls, "drop table") || strings.HasPrefix(ls, "drop view") || strings.Contains(ls, "(y/n)") {
+            rendered = stylePrompt.Render(m.status)
+        } else if strings.Contains(ls, "error") {
+            rendered = styleError.Render(m.status)
+        } else {
+            rendered = styleInfo.Render(m.status)
+        }
+        out.WriteString("\n" + rendered + "\n")
     }
     return out.String()
 }
@@ -845,6 +1013,47 @@ func without(names []string, name string) []string {
     return out
 }
 
+func (m *model) deleteCurrentRow() error {
+    if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
+        return fmt.Errorf("no table selected")
+    }
+    if m.selRow < 0 || m.selRow >= len(m.preview) {
+        return fmt.Errorf("no row selected")
+    }
+    table := m.tables[m.cursor]
+    // Prefer explicit PKs
+    var pkCols []colInfo
+    for _, c := range m.tableCols {
+        if c.PKOrder > 0 { pkCols = append(pkCols, c) }
+    }
+    if len(pkCols) > 0 {
+        // Build WHERE using all PK parts (supports composite PK)
+        whereParts := make([]string, 0, len(pkCols))
+        params := make([]any, 0, len(pkCols))
+        for _, pk := range pkCols {
+            whereParts = append(whereParts, fmt.Sprintf("%s = ?", quoteIdent(pk.Name)))
+            // pull value from current preview row
+            idx := findColIndex(m.previewColumns, pk.Name)
+            if idx >= 0 && idx < len(m.preview[m.selRow]) {
+                params = append(params, m.preview[m.selRow][idx])
+            } else {
+                params = append(params, nil)
+            }
+        }
+        q := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteIdent(table), strings.Join(whereParts, " AND "))
+        _, err := m.db.Exec(q, params...)
+        return err
+    }
+    // Fallback to rowid
+    if m.previewRowIDs == nil || m.selRow >= len(m.previewRowIDs) {
+        return fmt.Errorf("cannot resolve row identifier (no pk/rowid)")
+    }
+    rowid := m.previewRowIDs[m.selRow]
+    q := fmt.Sprintf("DELETE FROM %s WHERE rowid = ?", quoteIdent(table))
+    _, err := m.db.Exec(q, rowid)
+    return err
+}
+
 func isTextType(typeUpper string) bool {
     t := typeUpper
     return strings.Contains(t, "CHAR") || strings.Contains(t, "TEXT") || strings.Contains(t, "CLOB")
@@ -960,5 +1169,35 @@ func getUniqueIndexes(db *sql.DB, table string) ([]uniqueIndex, error) {
         if len(cols) > 0 { out = append(out, uniqueIndex{Name: ix.name, Columns: cols}) }
     }
     return out, nil
+}
+
+func getObjectType(db *sql.DB, name string) (string, error) {
+    var typ string
+    err := db.QueryRow(`SELECT type FROM sqlite_schema WHERE name = ? LIMIT 1`, name).Scan(&typ)
+    if err != nil { return "", err }
+    if typ != "table" && typ != "view" { typ = "table" }
+    return typ, nil
+}
+
+func (m *model) deleteCurrentTable() error {
+    if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
+        return fmt.Errorf("no table selected")
+    }
+    name := m.confirmDeleteTarget
+    if name == "" { name = m.tables[m.cursor] }
+    typ := m.confirmDeleteType
+    if typ == "" {
+        var err error
+        typ, err = getObjectType(m.db, name)
+        if err != nil { return err }
+    }
+    stmt := ""
+    if typ == "view" {
+        stmt = fmt.Sprintf("DROP VIEW IF EXISTS %s", quoteIdent(name))
+    } else {
+        stmt = fmt.Sprintf("DROP TABLE IF EXISTS %s", quoteIdent(name))
+    }
+    _, err := m.db.Exec(stmt)
+    return err
 }
 
