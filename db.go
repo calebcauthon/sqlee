@@ -11,34 +11,62 @@ import (
 func openDB() (*sql.DB, error) {
     // Use modernc.org/sqlite (pure Go) so user doesn't need CGO
     path := resolveDBPath()
+    if path == "" {
+        return nil, fmt.Errorf("no SQLite .db file found. Provide a path: 'go run . <db path>' or set DB_PATH, or place a .db in current directory or in 'instance/'")
+    }
     return sql.Open("sqlite", path)
 }
 
 func resolveDBPath() string {
+    // 1) CLI arg: go run . <db path>
+    if len(os.Args) > 1 && os.Args[1] != "" {
+        return os.Args[1]
+    }
+    // 2) Env override
     if p := os.Getenv("DB_PATH"); p != "" {
         return p
     }
-    // Try common locations relative to executable and cwd
-    candidates := []string{
-        "instance/neverlost.db",
-        "../instance/neverlost.db",
-        // Absolute path for this workspace for convenience
-        "/Users/caleb/Code/neverlost_api/instance/neverlost.db",
+    // 3) Auto-discover newest .db in current working directory
+    if p, ok := newestDBInDir("."); ok {
+        return p
     }
-    if exe, err := os.Executable(); err == nil {
-        base := filepath.Dir(exe)
-        candidates = append(candidates,
-            filepath.Join(base, "instance/neverlost.db"),
-            filepath.Join(base, "../instance/neverlost.db"),
-        )
+    // 4) Otherwise, look under instance/
+    if p, ok := newestDBInDir("instance"); ok {
+        return p
     }
-    for _, c := range candidates {
-        if _, err := os.Stat(c); err == nil {
-            return c
+    // 5) Nothing found
+    return ""
+}
+
+// newestDBInDir returns the most recently modified .db file in dir, not recursive.
+// It returns (path, true) if found, otherwise ("", false).
+func newestDBInDir(dir string) (string, bool) {
+    entries, err := os.ReadDir(dir)
+    if err != nil {
+        return "", false
+    }
+    var newestPath string
+    var newestModNano int64
+    for _, entry := range entries {
+        if entry.IsDir() { continue }
+        name := entry.Name()
+        if !strings.HasSuffix(strings.ToLower(name), ".db") {
+            continue
+        }
+        info, err := entry.Info()
+        if err != nil {
+            continue
+        }
+        mod := info.ModTime().UnixNano()
+        if newestPath == "" || mod > newestModNano {
+            newestPath = filepath.Join(dir, name)
+            newestModNano = mod
         }
     }
-    // Fallback
-    return "instance/neverlost.db"
+    if newestPath == "" {
+        return "", false
+    }
+    return newestPath, true
 }
 
 func listTables(db *sql.DB) ([]string, error) {
@@ -127,3 +155,4 @@ func getObjectType(db *sql.DB, name string) (string, error) {
     if typ != "table" && typ != "view" { typ = "table" }
     return typ, nil
 }
+
