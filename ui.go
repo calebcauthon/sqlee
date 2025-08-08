@@ -4,14 +4,38 @@ import (
     "fmt"
     "sort"
     "strings"
+    "time"
 
     tea "github.com/charmbracelet/bubbletea"
 )
 
-func (m model) Init() tea.Cmd { return nil }
+// Periodic tables refresh
+const tablesRefreshInterval = 2 * time.Second
+
+type tablesTickMsg struct{}
+
+func tablesRefreshCmd() tea.Cmd {
+    return tea.Tick(tablesRefreshInterval, func(time.Time) tea.Msg { return tablesTickMsg{} })
+}
+
+func (m model) Init() tea.Cmd { return tablesRefreshCmd() }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
+    case tablesTickMsg:
+        if m.db != nil {
+            if t, err := listTables(m.db); err == nil {
+                sort.Strings(t)
+                if !equalStrings(t, m.allTables) {
+                    m.allTables = t
+                    // keep current filter and selection where possible
+                    m.applyFilter()
+                }
+            } else {
+                m.status = fmt.Sprintf("reload error: %v", err)
+            }
+        }
+        return m, tablesRefreshCmd()
     case tea.KeyMsg:
         // If currently editing a cell, handle input differently
         if m.editingActive {
@@ -417,4 +441,17 @@ func (m model) View() string {
         out.WriteString("\n" + rendered + "\n")
     }
     return out.String()
+}
+
+// equalStrings returns true if the two string slices are identical in length and element order.
+func equalStrings(a, b []string) bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i := range a {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
 }
