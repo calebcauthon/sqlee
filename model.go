@@ -31,6 +31,11 @@ type model struct {
     confirmDeleteActive bool
     confirmDeleteTarget string
     confirmDeleteType   string // "table" or "view"
+    // AI prompt state
+    aiPromptActive  bool
+    aiPromptText    string
+    aiThinking      bool
+    aiOutput        string
 }
 
 type colInfo struct {

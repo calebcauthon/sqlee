@@ -22,6 +22,19 @@ func (m model) Init() tea.Cmd { return tablesRefreshCmd() }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
+    case aiResponseMsg:
+        m.aiThinking = false
+        if msg.err != nil {
+            m.status = fmt.Sprintf("AI error: %v", msg.err)
+            m.aiOutput = ""
+        } else {
+            m.aiOutput = strings.TrimSpace(msg.text)
+            if m.aiOutput == "" {
+                m.aiOutput = "(empty response)"
+            }
+            m.status = "AI: done"
+        }
+        return m, nil
     case tablesTickMsg:
         if m.db != nil {
             if t, err := listTables(m.db); err == nil {
@@ -37,6 +50,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         }
         return m, tablesRefreshCmd()
     case tea.KeyMsg:
+        // AI prompt input mode has highest priority
+        if m.aiPromptActive {
+            switch msg.Type {
+            case tea.KeyRunes:
+                if len(msg.Runes) > 0 {
+                    m.aiPromptText += string(msg.Runes)
+                }
+                return m, nil
+            case tea.KeyBackspace:
+                r := []rune(m.aiPromptText)
+                if len(r) > 0 {
+                    m.aiPromptText = string(r[:len(r)-1])
+                }
+                return m, nil
+            case tea.KeyEnter:
+                prompt := strings.TrimSpace(m.aiPromptText)
+                m.aiPromptActive = false
+                if prompt == "" {
+                    m.status = "cancelled"
+                    return m, nil
+                }
+                m.aiThinking = true
+                m.status = "AI: sending..."
+                m.aiOutput = ""
+                return m, runLLM(prompt)
+            case tea.KeyEsc:
+                m.aiPromptActive = false
+                m.aiPromptText = ""
+                m.status = "cancelled"
+                return m, nil
+            default:
+                return m, nil
+            }
+        }
         // If currently editing a cell, handle input differently
         if m.editingActive {
             switch msg.Type {
@@ -179,6 +226,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 _ = m.db.Close()
             }
             return m, tea.Quit
+        case "ctrl+p":
+            if !m.aiThinking {
+                m.aiPromptActive = true
+                m.aiPromptText = ""
+                m.status = stylePrompt.Render("AI Prompt: type and Enter; Esc to cancel")
+            }
         case "c":
             // begin editing the current cell when focus is on preview
             if m.focusPreview && m.selRow >= 0 && m.selRow < len(m.preview) && m.selCol >= 0 && m.selCol < len(m.previewColumns) {
@@ -319,7 +372,7 @@ func (m model) View() string {
 
     // Render tables list
     var left strings.Builder
-    left.WriteString(styleHeader.Render("Tables (j/k or ↓/↑, → to preview, / search, r reload, q quit)") + "\n")
+    left.WriteString(styleHeader.Render("Tables (j/k or ↓/↑, → preview, / search, r reload, ctrl+p AI, q quit)") + "\n")
     if m.searchActive || m.searchQuery != "" {
         left.WriteString(styleSearch.Render("/" + m.searchQuery) + "\n")
     }
@@ -439,6 +492,20 @@ func (m model) View() string {
             rendered = styleInfo.Render(m.status)
         }
         out.WriteString("\n" + rendered + "\n")
+    }
+    if m.aiPromptActive {
+        out.WriteString("\n" + stylePrompt.Render("AI> ") + m.aiPromptText + "\n")
+    }
+    if m.aiThinking || m.aiOutput != "" {
+        tag := styleHeader.Render("AI Response")
+        out.WriteString("\n" + tag + "\n")
+        if m.aiThinking {
+            out.WriteString(styleInfo.Render("thinking...") + "\n")
+        }
+        if m.aiOutput != "" {
+            // Render within right pane width roughly
+            out.WriteString(m.aiOutput + "\n")
+        }
     }
     return out.String()
 }

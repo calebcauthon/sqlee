@@ -27,6 +27,14 @@ DB_PATH=./path/to/your.db go run .
 go run .
 ```
 
+### AI configuration
+
+```sh
+export OPENAI_API_KEY=sk-...
+# optional
+export LLM_MODEL=gpt-4o-mini
+```
+
 ### DB path resolution (priority order)
 - **CLI arg**: `go run . <db path>`
 - **Env var**: `DB_PATH=/path/to/db.sqlite`
@@ -38,9 +46,11 @@ go run .
 - j / down: move down
 - k / up: move up
 - r: reload table list
+- ctrl+p: open AI prompt, type, Enter to send; Esc to cancel
 - q / ctrl+c: quit
 
 ## Notes
 - Shows tables and views. Preview shows up to 10 rows, truncates long cells.
 - Uses `modernc.org/sqlite` (pure Go driver), no CGO needed.
+- AI uses `langchaingo` OpenAI client. Set `OPENAI_API_KEY` in env. Optional: `LLM_MODEL` (default `gpt-4o-mini`).
 

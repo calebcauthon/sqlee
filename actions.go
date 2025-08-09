@@ -8,6 +8,12 @@ import (
     "github.com/google/uuid"
 )
 
+// aiResponseMsg is delivered when the async LLM call completes.
+type aiResponseMsg struct {
+    text string
+    err  error
+}
+
 func (m *model) duplicateCurrentRow() error {
     if m.db == nil || m.cursor < 0 || m.cursor >= len(m.tables) {
         return fmt.Errorf("no table selected")

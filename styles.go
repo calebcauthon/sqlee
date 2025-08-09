@@ -17,6 +17,7 @@ var (
     styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
     styleInfo      = lipgloss.NewStyle().Foreground(lipgloss.Color("178"))
     styleColSelect = lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Bold(true)
+    styleAI        = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 )
 
 // ansiRegexp matches ANSI SGR escape sequences for styling (e.g., "\x1b[31m").
